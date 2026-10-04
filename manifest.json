@@ -1,0 +1,16 @@
+{
+  "short_name": "Altar",
+  "name": "Altar",
+  "description": "Altar Windows 开发环境管理器",
+  "theme_color": "#000000",
+  "background_color": "#000000",
+  "display": "fullscreen",
+  "orientation": "portrait",
+  "icons": [
+    {
+      "src": "/altar-logo.png",
+      "sizes": "1024x1024",
+      "type": "image/png"
+    }
+  ]
+}
