@@ -8,9 +8,11 @@ const { spawn } = require('node:child_process');
 const { catalog, publicCatalog } = require('./catalog.cjs');
 const { createProviders } = require('./providers.cjs');
 const { downloadFile } = require('./downloader.cjs');
+const { readJson, writeJsonAtomic } = require('../core/json-store.cjs');
+const { createValidationGateway, createDownloadGateway, createInstallGateway } = require('../core/gateways.cjs');
 
 const REGIONS = new Set(['auto', 'china', 'international']);
-const LOG_LEVELS = new Set(['error', 'normal', 'verbose']);
+const LOG_LEVELS = new Set(['error', 'normal', 'verbose', 'debug', 'trace']);
 const PACKAGE_KEYS = ['pip', 'npm', 'maven', 'cargo', 'go'];
 const VERSION = /^[A-Za-z0-9][A-Za-z0-9.+_-]{0,80}$/;
 
@@ -20,10 +22,13 @@ function createInstallerService({ dataDir, platform, emit = () => {}, providers:
     packageVersionsImpl: platform.listPackageVersions?.bind(platform),
     mirrorBaseUrl: () => state.settings.mirrorBaseUrl,
   });
+  const validation = createValidationGateway({ catalog, regions: REGIONS, versionPattern: VERSION });
+  const downloads = createDownloadGateway(downloader);
+  const installs = createInstallGateway(platform);
   const stateFile = path.join(dataDir, 'installer-state.json');
   let state = {
     installations: [], jobs: [],
-    settings: { sourceRegion: 'auto', logLevel: 'normal', mirrorBaseUrl: process.env.DEV_ENV_MIRROR_BASE_URL || '', registryMirrors: Object.fromEntries(PACKAGE_KEYS.map(key => [key, false])) },
+  settings: { sourceRegion: 'auto', logLevel: 'normal', mirrorBaseUrl: process.env.DEV_ENV_MIRROR_BASE_URL || 'https://raw.githubusercontent.com/ransen1337-star/altar-git-mirror/main', registryMirrors: Object.fromEntries(PACKAGE_KEYS.map(key => [key, false])) },
   };
   let saving = Promise.resolve();
   let mutation = Promise.resolve();
@@ -32,8 +37,8 @@ function createInstallerService({ dataDir, platform, emit = () => {}, providers:
   const sourceConfirmations = new Map();
   let running = 0;
 
-  const ready = fsp.readFile(stateFile, 'utf8').then(text => {
-    const parsed = JSON.parse(text);
+  const ready = readJson(stateFile, null).then(parsed => {
+    if (!parsed) return;
     if (Array.isArray(parsed.installations)) state.installations = parsed.installations;
     if (Array.isArray(parsed.jobs)) state.jobs = parsed.jobs.map(job => ({
       ...job, status: ['running', 'awaiting-confirmation'].includes(job.status) ? 'paused' : job.status,
@@ -42,19 +47,17 @@ function createInstallerService({ dataDir, platform, emit = () => {}, providers:
     if (parsed.settings && REGIONS.has(parsed.settings.sourceRegion)) {
       state.settings = {
         sourceRegion: parsed.settings.sourceRegion,
-        logLevel: LOG_LEVELS.has(parsed.settings.logLevel) ? parsed.settings.logLevel : 'normal',
+        logLevel: LOG_LEVELS.has(String(parsed.settings.logLevel || '').toLowerCase()) ? String(parsed.settings.logLevel).toLowerCase() : 'normal',
         mirrorBaseUrl: typeof parsed.settings.mirrorBaseUrl === 'string' ? parsed.settings.mirrorBaseUrl : state.settings.mirrorBaseUrl,
         registryMirrors: Object.fromEntries(PACKAGE_KEYS.map(key => [key, parsed.settings.registryMirrors?.[key] === true])),
       };
     }
-  }).catch(error => { if (error.code !== 'ENOENT') throw error; });
+  });
 
   function save() {
     saving = saving.then(async () => {
       await fsp.mkdir(dataDir, { recursive: true });
-      const temporary = `${stateFile}.${crypto.randomUUID()}.tmp`;
-      await fsp.writeFile(temporary, JSON.stringify(state, null, 2), 'utf8');
-      await fsp.rename(temporary, stateFile);
+      await writeJsonAtomic(stateFile, state);
     });
     return saving;
   }
@@ -81,14 +84,15 @@ function createInstallerService({ dataDir, platform, emit = () => {}, providers:
     }
     return result;
   }
-  function log(job, message) {
+  function log(job, message, levelOverride) {
     const text = String(message).trim();
     if (!text) return;
-    const level = /error|fail|fatal|拒绝|失败|错误/i.test(text) ? 'error' : 'verbose';
+    const marker = text.match(/^\[(trace|debug|verbose|info)\]/i)?.[1]?.toLowerCase();
+    const level = /error|fail|fatal|拒绝|失败|错误/i.test(text) ? 'error' : (levelOverride || marker || 'verbose');
     if (state.settings.logLevel === 'error' && level !== 'error') return;
     const stamp = new Date().toISOString();
     job.logs.push(...text.split(/\r?\n/).filter(Boolean).slice(-8).map(line => `[${stamp}] [${level.toUpperCase()}] ${line}`));
-    job.logs = job.logs.slice(-150);
+    job.logs = job.logs.slice(-500);
     notify('jobs');
   }
   function setStage(job, stage, progress) {
@@ -98,41 +102,11 @@ function createInstallerService({ dataDir, platform, emit = () => {}, providers:
   }
 
   function assertId(id) {
-    const entry = catalog.find(item => item.id === id);
-    if (!entry) throw new Error('Unknown environment');
-    return entry;
+    return validation.assertEnvironment(id);
   }
 
   function validateRequest(input) {
-    if (!input || typeof input !== 'object' || Array.isArray(input)) throw new Error('Invalid install request');
-    const entry = assertId(input.id);
-    const scope = input.scope || 'user';
-    if (scope !== 'user' && scope !== 'system') throw new Error('Invalid install scope');
-    if (scope === 'system' && ['rustup', 'msys2'].includes(entry.installMethod)) {
-      throw new Error(`${entry.name} supports user installation only`);
-    }
-    const version = input.version || 'latest';
-    if (typeof version !== 'string' || !VERSION.test(version)) throw new Error('Invalid version');
-    if (entry.installMethod !== 'archive' && entry.installMethod !== 'msys2' && entry.installMethod !== 'winget' && version !== 'latest') {
-      throw new Error('Version selection is unavailable for this installer');
-    }
-    const source = input.source || state.settings.sourceRegion;
-    if (!REGIONS.has(source)) throw new Error('Invalid download region');
-    let installPath = input.path || null;
-    if (installPath) {
-      if (!['archive', 'rustup', 'msys2'].includes(entry.installMethod)) throw new Error('Custom path is unsupported');
-      if (scope === 'system') throw new Error('System installations use the managed ProgramData location');
-      if (typeof installPath !== 'string' || !path.win32.isAbsolute(installPath) || !/^[A-Za-z]:\\/.test(installPath) || installPath.includes(';') || installPath.includes('\0')) {
-        throw new Error('Install path must be an absolute local drive path');
-      }
-      installPath = path.win32.normalize(installPath);
-      const parsed = path.win32.parse(installPath);
-      if (installPath === parsed.root || installPath.length < parsed.root.length + 4) throw new Error('Install path is too broad');
-    }
-    const addToPath = input.addToPath === undefined ? true : input.addToPath;
-    if (typeof addToPath !== 'boolean') throw new Error('Invalid PATH option');
-    if (input.withTypeScript !== undefined && (entry.id !== 'node' || typeof input.withTypeScript !== 'boolean')) throw new Error('Invalid TypeScript option');
-    return { id: entry.id, version, scope, path: installPath, addToPath, source, withTypeScript: input.withTypeScript === true };
+    return validation.validateInstallRequest(input, state.settings);
   }
 
   async function externalInstallations() {
@@ -178,8 +152,8 @@ function createInstallerService({ dataDir, platform, emit = () => {}, providers:
         }
       }).catch(async error => {
         if (controller.signal.aborted || job.status === 'paused' || job.status === 'cancelled') return;
-        job.status = 'failed'; job.error = error.message || String(error); job.stage = 'Failed';
-        log(job, job.error);
+        job.status = 'failed'; job.error = error.stack || error.message || String(error); job.stage = 'Failed';
+        log(job, job.error, 'error');
       }).finally(async () => {
         controllers.delete(job.id); running -= 1;
         await save(); notify('jobs'); notify('scan');
@@ -261,9 +235,11 @@ function createInstallerService({ dataDir, platform, emit = () => {}, providers:
     const archive = path.join(dataDir, 'downloads', id, `${selected}-${release.filename}`);
     await fsp.mkdir(work, { recursive: true });
     setStage(job, `Downloading ${id} ${selected}`, dependency ? 5 : 10);
-    const downloaded = await downloader({
+    log(job, `[debug] install.prepare id=${id} version=${selected} source=${source} destination=${archive}`);
+    const downloaded = await downloads.fetchArtifact({
       urls: release.urls, destination: archive, hash: release.hash, algorithm: release.algorithm,
       signal, onProgress: progress => setStage(job, `Downloading ${id} ${selected}`, dependency ? 5 + progress * 12 : 10 + progress * 60),
+      onLog: message => log(job, message),
       maxConnections: 4,
       onSourceFallback: async ({ failedUrl, nextUrl, error }) => {
         // Every fallback URL is resolved from a release feed and is checked
@@ -276,6 +252,7 @@ function createInstallerService({ dataDir, platform, emit = () => {}, providers:
     });
     check(signal);
     setStage(job, `Extracting ${id}`, dependency ? 18 : 73);
+    log(job, `[debug] extract.target staging=${path.join(work, 'extracted')} archive=${archive}`);
     const extracted = await extractArchive(archive, path.join(work, 'extracted'), signal);
     const stagedCommand = commandFor(id, extracted);
     const isMsys2 = entry.installMethod === 'msys2';
@@ -293,16 +270,18 @@ function createInstallerService({ dataDir, platform, emit = () => {}, providers:
     }
     check(signal);
     setStage(job, `Verifying ${id}`, dependency ? 20 : 82);
+    log(job, `[debug] verify.command=${stagedCommand} expected=${selected}`);
     const jdk = id === 'kotlin' || id === 'scala' ? state.installations.find(item => item.id === 'jdk' && item.active) : null;
     const env = jdk ? { ...process.env, JAVA_HOME: jdk.path, PATH: `${path.win32.join(jdk.path, 'bin')};${process.env.PATH}` } : undefined;
-    if (!isMsys2) await platform.verify({ command: stagedCommand, args: versionArgs(id), expectedVersion: selected, env, signal });
+    if (!isMsys2) await installs.verify({ command: stagedCommand, args: versionArgs(id), expectedVersion: selected, env, signal });
     check(signal);
     let committed = false;
     try {
       await serialized(async () => {
         check(signal);
         setStage(job, `Committing ${id}`, dependency ? 23 : 90);
-        await platform.commitDirectory({ source: extracted, destination: installRoot, scope });
+        log(job, `[debug] commit.source=${extracted} destination=${installRoot} scope=${scope}`);
+        await installs.commit({ source: extracted, destination: installRoot, scope });
         committed = true;
         check(signal);
         if (isMsys2) {
@@ -311,18 +290,21 @@ function createInstallerService({ dataDir, platform, emit = () => {}, providers:
             scope, signal, msysRoot: installRoot, onLog: text => log(job, text),
           }));
         }
-        await platform.verify({ command: commandFor(id, installRoot), args: versionArgs(id), expectedVersion: isMsys2 ? undefined : selected, env, signal });
+        await installs.verify({ command: commandFor(id, installRoot), args: versionArgs(id), expectedVersion: isMsys2 ? undefined : selected, env, signal });
         const paths = addToPath ? pathEntries(id, installRoot, withTypeScript) : [];
         const prior = state.installations.filter(item => item.id === id && item.scope === scope && item.active);
         const removed = [];
         try {
           for (const old of prior) {
-            await platform.removePaths({ scope, paths: old.paths || [] });
+            await installs.removePaths({ scope, paths: old.paths || [] });
             removed.push(old);
           }
-          if (paths.length) await platform.activatePaths({ scope, paths });
+          if (paths.length) {
+            log(job, `[debug] path.activate scope=${scope} entries=${paths.join(';')}`);
+            await installs.activatePaths({ scope, paths });
+          }
         } catch (error) {
-          for (const old of removed) await platform.activatePaths({ scope, paths: old.paths || [] }).catch(() => {});
+          for (const old of removed) await installs.activatePaths({ scope, paths: old.paths || [] }).catch(() => {});
           throw error;
         }
         const record = {
@@ -437,17 +419,17 @@ function createInstallerService({ dataDir, platform, emit = () => {}, providers:
       const removed = [];
       try {
         for (const old of prior) {
-          await platform.removePaths({ scope: old.scope, paths: old.paths || [] });
+          await installs.removePaths({ scope: old.scope, paths: old.paths || [] });
           removed.push(old);
         }
         const paths = pathEntries(record.id, record.path, record.withTypeScript);
-        await platform.activatePaths({ scope: record.scope, paths });
+        await installs.activatePaths({ scope: record.scope, paths });
         for (const old of prior) old.active = false;
         record.active = true; record.paths = paths; record.addToPath = true;
         await save(); notify('scan');
         return { installationId };
       } catch (error) {
-        for (const old of removed) await platform.activatePaths({ scope: old.scope, paths: old.paths || [] }).catch(() => {});
+        for (const old of removed) await installs.activatePaths({ scope: old.scope, paths: old.paths || [] }).catch(() => {});
         throw error;
       }
     });
@@ -459,10 +441,10 @@ function createInstallerService({ dataDir, platform, emit = () => {}, providers:
     if (!record) throw new Error('Only installations tracked by this tool can be removed');
     return serialized(async () => {
       if (record.method === 'archive' || record.method === 'msys2') {
-        if (record.paths?.length) await platform.removePaths({ scope: record.scope, paths: record.paths });
+        if (record.paths?.length) await installs.removePaths({ scope: record.scope, paths: record.paths });
         try { await platform.removeDirectory({ path: record.path, scope: record.scope }); }
         catch (error) {
-          if (record.paths?.length) await platform.activatePaths({ scope: record.scope, paths: record.paths }).catch(() => {});
+          if (record.paths?.length) await installs.activatePaths({ scope: record.scope, paths: record.paths }).catch(() => {});
           throw error;
         }
       } else if (record.method === 'winget') {
@@ -528,7 +510,7 @@ function createInstallerService({ dataDir, platform, emit = () => {}, providers:
   async function setSettings(input) {
     await ready;
     if (!input || typeof input !== 'object' || !REGIONS.has(input.sourceRegion)) throw new Error('Invalid source region');
-    const logLevel = input.logLevel || state.settings.logLevel;
+    const logLevel = String(input.logLevel || state.settings.logLevel).toLowerCase();
     if (!LOG_LEVELS.has(logLevel)) throw new Error('Invalid log level');
     const mirrors = input.registryMirrors;
     if (!mirrors || typeof mirrors !== 'object' || PACKAGE_KEYS.some(key => typeof mirrors[key] !== 'boolean')) throw new Error('Invalid package mirror selection');

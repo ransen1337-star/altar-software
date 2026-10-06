@@ -5,7 +5,7 @@ import type { CatalogEntry, DevSettings, InstallJob, Installation } from "./type
 const defaultSettings: DevSettings = {
   sourceRegion: "auto",
   logLevel: "normal",
-  mirrorBaseUrl: "",
+  mirrorBaseUrl: "https://raw.githubusercontent.com/ransen1337-star/altar-git-mirror/main",
   registryMirrors: { pip: false, npm: false, maven: false, cargo: false, go: false },
 };
 
